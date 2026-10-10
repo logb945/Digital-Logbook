@@ -4,23 +4,41 @@ import { useAuth } from '@/context/AuthContext';
 import { NavBar } from '@/components/NavBar';
 import { Header } from '@/components/Header';
 import { QuickEntryBar } from '@/components/QuickEntryBar';
+import { ProjectFilterBlock } from '@/components/SearchFilters';
+import { ToolbarDropdown } from '@/components/ToolbarDropdown';
+import { DueSoonRail } from '@/components/DueSoonRail';
 import { setPriority } from '@/functions/project/priority.js';
+import { getFields } from '@/functions/project/fields.js';
 import { checkUser } from '@/functions/profile/login.js';
 import { cacheGet, cacheSubscribe, CACHE_STORES } from '@/lib/cache';
 import { syncAllData } from '@/CacheFunctions';
 import { trackCreatedEntry } from '@/lib/recentlyCreated';
 import { EntryBox } from '@/pages/NewEntry';
+import { AddEntry } from '@/pages/AddEntry';
+import { KanbanBoardView } from '@/pages/Kanban';
+import { TimelineView } from '@/pages/Timeline';
 import { ChecklistView } from '@/Templates/EntryTemplates/EntryChecklist';
 import EntriesByDueDateBoard from '@/Templates/ProjectTemplates/EntriesByDueDateBoard';
 import ProjectTaskTable from '@/Templates/ProjectTemplates/ProjectTable';
 import VoiceFeature from '@/pages/VoiceFeature';
 import { type EntryPayload } from '@/lib/entryPayload';
+import { type CalendarEntry } from '@/lib/calendar';
 import { buildProjectColorMap, resolveProjectColor } from '@/lib/projectColorMap';
+import { normalizeField } from '@/lib/fieldSchema';
+import {
+  activeProjectFilterCount,
+  applyProjectFilters,
+  defaultProjectFilters,
+  matchesTextQuery,
+  pinFirst,
+  type ProjectFilters,
+} from '@/lib/entryFilters';
 import { usePref, setPref } from '@/functions/preferences';
 import { isActiveEntry } from '@/functions/dashboard/overdue.js';
 import { getEffectiveArchivedProjectNames } from '@/functions/project/archiveState.js';
 
 type Entry = Record<string, unknown>;
+type DisplayMode = 'cards' | 'checklist' | 'board' | 'table' | 'kanban' | 'timeline';
 
 export function AllEntriesPage() {
   const { user, signOut } = useAuth();
@@ -35,14 +53,18 @@ export function AllEntriesPage() {
     void setPref('allentries_sort_by', next);
   }, []);
 
-  // Display mode: cards, checklist, board, or table - persisted per-user
+  // Display mode: cards, checklist, board, table, kanban, or timeline - persisted per-user
   const rawDisplayMode = usePref('allentries_display_mode');
   const displayMode = (
-    rawDisplayMode === 'checklist' || rawDisplayMode === 'board' || rawDisplayMode === 'table'
+    rawDisplayMode === 'checklist' ||
+    rawDisplayMode === 'board' ||
+    rawDisplayMode === 'table' ||
+    rawDisplayMode === 'kanban' ||
+    rawDisplayMode === 'timeline'
       ? rawDisplayMode
       : 'cards'
-  ) as 'cards' | 'checklist' | 'board' | 'table';
-  const setDisplayMode = useCallback((next: 'cards' | 'checklist' | 'board' | 'table') => {
+  ) as DisplayMode;
+  const setDisplayMode = useCallback((next: DisplayMode) => {
     void setPref('allentries_display_mode', next);
   }, []);
 
@@ -54,8 +76,23 @@ export function AllEntriesPage() {
   // Voice recorder
   const [voiceOpen, setVoiceOpen] = useState(false);
 
-  // Static placeholder for quick entry (no AI)
-  const aiPlaceholder = 'Write what you worked on...';
+  // Corner add-entry button — project picker then the entry form
+  const [newEntryOpen, setNewEntryOpen] = useState(false);
+  const [newEntryProject, setNewEntryProject] = useState('');
+
+  // Feed filters — entries are mixed across projects, so the panel narrows the
+  // feed by project-level criteria (project name, entry count, field count)
+  // instead of per-project field values.
+  const [projectFilters, setProjectFilters] = useState<ProjectFilters>(() =>
+    defaultProjectFilters()
+  );
+  // Field counts per project — read from the fields cache, fetched when missing.
+  const [fieldCounts, setFieldCounts] = useState<Record<string, number>>({});
+  // Field data types per project — powers the field-type filter.
+  const [fieldTypes, setFieldTypes] = useState<Record<string, string[]>>({});
+
+  // Static placeholder for quick entry (no AI) — kept in sync with the home page
+  const aiPlaceholder = 'Capture quick entry';
 
   const email = user?.email || '';
 
@@ -159,9 +196,52 @@ export function AllEntriesPage() {
     return () => unsubs.forEach((unsub) => unsub());
   }, [email, reload]);
 
+  // Field counts and field types for the filter panel. Field definitions live
+  // per project, so each project's rows are read from the cache and only
+  // fetched when missing.
+  useEffect(() => {
+    if (!email) return;
+    const names = Array.from(
+      new Set([
+        ...projects.map((p) => p.project_name as string),
+        ...entries.map((e) => e.project_name as string),
+      ])
+    ).filter(Boolean);
+    if (names.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      const nextCounts: Record<string, number> = {};
+      const nextTypes: Record<string, string[]> = {};
+      await Promise.all(
+        names.map(async (name) => {
+          try {
+            let cached = await cacheGet(CACHE_STORES.FIELDS, `${email}:${name}`);
+            if (!cached?.data) cached = await getFields(email, name);
+            const rows = Array.isArray(cached?.data) ? cached.data : [];
+            const fields = rows.filter((r: Record<string, unknown>) => r?.field_name);
+            nextCounts[name] = fields.length;
+            nextTypes[name] = Array.from(
+              new Set(fields.map((r: Record<string, unknown>) => normalizeField(r).data_type))
+            );
+          } catch {
+            nextCounts[name] = 0;
+            nextTypes[name] = [];
+          }
+        })
+      );
+      if (!cancelled) {
+        setFieldCounts(nextCounts);
+        setFieldTypes(nextTypes);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [email, projects, entries]);
+
   const handleSetPriority = async (entryId: string, projectName: string, priorityValue: string) => {
     if (!email) return;
-    await setPriority(email, entryId, projectName, priorityValue);
+    await setPriority(email, priorityValue, projectName, entryId);
     loadData();
   };
 
@@ -173,6 +253,36 @@ export function AllEntriesPage() {
     [email, projects]
   );
 
+  // Entry counts per project — powers the "entry count" filter
+  const entryCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const e of entries) {
+      const name = (e.project_name as string) || '';
+      if (name) counts[name] = (counts[name] || 0) + 1;
+    }
+    return counts;
+  }, [entries]);
+
+  // Projects offered in the filter panel — anything with entries or fields
+  const projectNames = useMemo(
+    () =>
+      Array.from(new Set([...Object.keys(entryCounts), ...Object.keys(fieldCounts)])).sort(
+        (a, b) => a.localeCompare(b)
+      ),
+    [entryCounts, fieldCounts]
+  );
+
+  // Every field type used across the projects — the field-type filter options
+  const fieldTypeOptions = useMemo(
+    () =>
+      Array.from(new Set(Object.values(fieldTypes).flat()))
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b)),
+    [fieldTypes]
+  );
+
+  const activeFilters = activeProjectFilterCount(projectFilters);
+
   // Filtered entries
   const filteredEntries = useMemo(() => {
     // Active views only — no archived, deleted, or archived-project entries.
@@ -180,15 +290,17 @@ export function AllEntriesPage() {
       isActiveEntry(e, archivedProjectNames.has(String(e.project_name || '')))
     );
 
-    // Apply search filter
+    // Apply search filter — summary, project name and every field value
     if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      filtered = filtered.filter((e) => {
-        const summary = (e.summary as string) || '';
-        const project = (e.project_name as string) || '';
-        return summary.toLowerCase().includes(q) || project.toLowerCase().includes(q);
-      });
+      filtered = filtered.filter((e) => matchesTextQuery(e, searchQuery));
     }
+
+    // Apply project filters — project name, entry count, field count, field type
+    filtered = applyProjectFilters(filtered, projectFilters, {
+      entryCounts,
+      fieldCounts,
+      fieldTypes,
+    });
 
     // Apply sort
     if (sortBy === 'priority') {
@@ -206,12 +318,55 @@ export function AllEntriesPage() {
       });
     }
 
-    return filtered;
-  }, [entries, archivedProjectNames, searchQuery, sortBy]);
+    return pinFirst(filtered);
+  }, [
+    entries,
+    archivedProjectNames,
+    searchQuery,
+    sortBy,
+    projectFilters,
+    entryCounts,
+    fieldCounts,
+    fieldTypes,
+  ]);
+
+  // Entries due within the next 3 days — the same window the home page uses;
+  // it feeds the right-hand due-soon rail.
+  const dueSoonEntries = useMemo(() => {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const threeDaysFromNow = new Date(startOfToday.getTime() + 3 * 24 * 60 * 60 * 1000);
+    return entries.filter((e) => {
+      if (e.archived) return false;
+      if (!e.due_date) return false;
+      const due = new Date(e.due_date as string);
+      if (isNaN(due.getTime())) return false;
+      return due >= startOfToday && due <= threeDaysFromNow;
+    });
+  }, [entries]);
 
   const colorMap = useMemo(
     () => buildProjectColorMap(projects as Array<Record<string, unknown>>),
     [projects]
+  );
+
+  // Kanban groups by status and Timeline is chronological — sorting does not
+  // apply there, so the Sort control is hidden while those views are active.
+  const showSortControl = displayMode !== 'kanban' && displayMode !== 'timeline';
+
+  // "New Entry" card that fronts the cards feed — opens the project picker,
+  // then the entry form for the chosen project.
+  const newEntryCard = (
+    <button
+      type="button"
+      className="entry-card-new"
+      onClick={() => setNewEntryOpen(true)}
+      title="Create a new entry"
+    >
+      <span className="entry-card-new__icon">+</span>
+      <span className="entry-card-new__title">New Entry</span>
+      <span className="entry-card-new__hint">Pick a project and add an entry</span>
+    </button>
   );
 
   return (
@@ -221,117 +376,110 @@ export function AllEntriesPage() {
       <NavBar entries={entries} activeView="all" />
 
       <main className="dash-main">
-        <Header title="My Items" entries={entries} projects={projects} />
+        <Header title="My Entries" entries={entries} projects={projects} />
 
-        {/* Search bar */}
-        <div className="feed-search-bar">
-          <svg
-            width="16"
-            height="16"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-          >
-            <circle cx="11" cy="11" r="8" />
-            <line x1="21" y1="21" x2="16.65" y2="16.65" />
-          </svg>
-          <input
-            type="text"
-            placeholder="Filter entries..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="feed-search-input"
+        {/* Search bar beside the AI quick-add bar */}
+        <div className="search-ai-row">
+          <ProjectFilterBlock
+            query={searchQuery}
+            onQueryChange={setSearchQuery}
+            placeholder="Search entries..."
+            projectNames={projectNames}
+            filters={projectFilters}
+            onFiltersChange={setProjectFilters}
+            fieldTypeOptions={fieldTypeOptions}
           />
-        </div>
 
-        {/* Display mode + Sort controls */}
-        <div className="feed-controls-row">
-          <div className="feed-view-toggle">
-            <button
-              className={`feed-view-btn ${displayMode === 'cards' ? 'active' : ''}`}
-              onClick={() => setDisplayMode('cards')}
-            >
-              Cards
-            </button>
-            <button
-              className={`feed-view-btn ${displayMode === 'checklist' ? 'active' : ''}`}
-              onClick={() => setDisplayMode('checklist')}
-            >
-              Checklist
-            </button>
-            <button
-              className={`feed-view-btn ${displayMode === 'board' ? 'active' : ''}`}
-              onClick={() => setDisplayMode('board')}
-            >
-              Board
-            </button>
-            <button
-              className={`feed-view-btn ${displayMode === 'table' ? 'active' : ''}`}
-              onClick={() => setDisplayMode('table')}
-            >
-              Table
-            </button>
-          </div>
-          <div className="feed-sort-group">
-            <span className="feed-sort-label">Sort:</span>
-            <button
-              className={`sort-btn ${sortBy === 'date' ? 'active' : ''}`}
-              onClick={() => setSortBy('date')}
-            >
-              <svg
-                width="12"
-                height="12"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-              >
-                <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
-                <line x1="16" y1="2" x2="16" y2="6" />
-                <line x1="8" y1="2" x2="8" y2="6" />
-                <line x1="3" y1="10" x2="21" y2="10" />
-              </svg>
-              Date
-            </button>
-            <button
-              className={`sort-btn ${sortBy === 'priority' ? 'active' : ''}`}
-              onClick={() => setSortBy('priority')}
-            >
-              <svg
-                width="12"
-                height="12"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-              >
-                <line x1="18" y1="20" x2="18" y2="10" />
-                <line x1="12" y1="20" x2="12" y2="4" />
-                <line x1="6" y1="20" x2="6" y2="14" />
-              </svg>
-              Priority
-            </button>
+          {/* Quick Entry Bar */}
+          <div className="search-ai-row__ai">
+            <QuickEntryBar
+              onEntryCreated={(info) => {
+                loadData();
+                // Track every created entry (single OR multi) in "Recently created".
+                for (const item of info?.created ?? []) {
+                  trackCreatedEntry(item);
+                }
+                // Navigate only when there's exactly one unambiguous target.
+                if ((info?.created?.length ?? 0) === 1 && info?.projectName) {
+                  navigate(`/project/${encodeURIComponent(info.projectName)}`);
+                }
+              }}
+              onVoiceOpen={() => setVoiceOpen(true)}
+              placeholder={aiPlaceholder}
+            />
           </div>
         </div>
 
-        {/* Quick Entry Bar */}
-        <QuickEntryBar
-          onEntryCreated={(info) => {
-            loadData();
-            // Track every created entry (single OR multi) in "Recently created".
-            for (const item of info?.created ?? []) {
-              trackCreatedEntry(item);
-            }
-            // Navigate only when there's exactly one unambiguous target.
-            if ((info?.created?.length ?? 0) === 1 && info?.projectName) {
-              navigate(`/project/${encodeURIComponent(info.projectName)}`);
-            }
-          }}
-          onVoiceOpen={() => setVoiceOpen(true)}
-          placeholder={aiPlaceholder}
-        />
+        {/* Page switcher: Entries / Projects */}
+        <div className="page-switcher-row">
+          <div
+            className="feed-view-toggle"
+            role="group"
+            aria-label="Switch between entries and projects"
+          >
+            <button
+              type="button"
+              className="feed-view-btn"
+              onClick={() => navigate('/dashboard')}
+              title="Back to projects"
+            >
+              Projects
+            </button>
+            <button
+              type="button"
+              className="feed-view-btn active"
+              aria-current="page"
+              onClick={() => navigate('/entries')}
+              title="Browse all entries"
+            >
+              Entries
+            </button>
+          </div>
 
+          {/* View + Sort sit together opposite the Entries/Projects toggle,
+              mirroring the search/AI bar row's layout. */}
+          <div className="page-switcher-controls">
+            <div className="feed-view-group">
+              <span className="feed-view-label">View:</span>
+              <ToolbarDropdown
+                value={displayMode}
+                onChange={setDisplayMode}
+                options={[
+                  { value: 'cards', label: 'Cards' },
+                  { value: 'checklist', label: 'Checklist' },
+                  { value: 'board', label: 'Board' },
+                  { value: 'table', label: 'Table' },
+                  { value: 'kanban', label: 'Kanban' },
+                  { value: 'timeline', label: 'Timeline' },
+                ]}
+              />
+            </div>
+
+            {showSortControl && (
+              <div className="feed-sort-group">
+                <span className="feed-sort-label">Sort:</span>
+                <ToolbarDropdown
+                  value={sortBy}
+                  onChange={setSortBy}
+                  menuAlign="right"
+                  options={[
+                    { value: 'date', label: 'Date' },
+                    { value: 'priority', label: 'Priority' },
+                  ]}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* "New Entry" card — fronts the split so the due-soon rail starts
+            below it, beside the entries. */}
+        {newEntryCard}
+
+        {/* Two-column split: entries on the left, the due-soon quick list on
+            the right. */}
+        <div className="dash-split">
+          <div className="dash-split__main">
         {/* Loading */}
         {loading && (
           <div className="feed-loading">
@@ -359,12 +507,29 @@ export function AllEntriesPage() {
                   <line x1="21" y1="21" x2="16.65" y2="16.65" />
                 </svg>
               </div>
-              <h2 className="empty-title">{searchQuery ? 'No results found' : 'No entries yet'}</h2>
+              <h2 className="empty-title">
+                {searchQuery
+                  ? 'No results found'
+                  : activeFilters > 0
+                    ? 'No entries match your filters'
+                    : 'No entries yet'}
+              </h2>
               <p className="empty-desc">
                 {searchQuery
                   ? `No entries match "${searchQuery}". Try a different search term.`
-                  : 'No entries to show right now.'}
+                  : activeFilters > 0
+                    ? 'Try widening or clearing the filters.'
+                    : 'No entries to show right now.'}
               </p>
+              {activeFilters > 0 && (
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() => setProjectFilters(defaultProjectFilters())}
+                >
+                  Clear filters
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -418,6 +583,17 @@ export function AllEntriesPage() {
             colorMap={colorMap}
           />
         )}
+        {!loading && filteredEntries.length > 0 && displayMode === 'kanban' && (
+          <KanbanBoardView
+            entries={filteredEntries as unknown as CalendarEntry[]}
+            email={email}
+            colorMap={colorMap}
+            onUpdated={() => loadData()}
+          />
+        )}
+        {!loading && filteredEntries.length > 0 && displayMode === 'timeline' && (
+          <TimelineView entries={filteredEntries as unknown as CalendarEntry[]} />
+        )}
         {!loading && filteredEntries.length > 0 && displayMode === 'cards' && (
           <div className="entries-feed">
             {filteredEntries.map((row, i) => (
@@ -435,7 +611,90 @@ export function AllEntriesPage() {
             ))}
           </div>
         )}
+              </div>
+
+              <DueSoonRail entries={dueSoonEntries} />
+            </div>
       </main>
+
+      {/* New Entry Modal — pick a project, then fill in the entry form */}
+      {newEntryOpen && (
+        <div
+          className="modal-overlay"
+          onClick={() => {
+            setNewEntryOpen(false);
+            setNewEntryProject('');
+          }}
+        >
+          <div
+            className={`modal-card glass modal-card-wide${newEntryProject ? ' modal-card--entry' : ''}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {!newEntryProject ? (
+              <>
+                <h2 className="modal-title">New Entry</h2>
+                <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', margin: 0 }}>
+                  Select a project:
+                </p>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.375rem' }}>
+                  {projects
+                    .filter((p) => !p.archived)
+                    .map((p) => (
+                      <button
+                        key={p.project_name as string}
+                        className="drawer-item"
+                        onClick={() => setNewEntryProject(p.project_name as string)}
+                        style={{ textAlign: 'left', justifyContent: 'flex-start' }}
+                      >
+                        <svg
+                          width="16"
+                          height="16"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                        >
+                          <path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                        </svg>
+                        {p.project_name as string}
+                      </button>
+                    ))}
+                  {projects.filter((p) => !p.archived).length === 0 && (
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem' }}>
+                      No projects yet. Create one first.
+                    </p>
+                  )}
+                </div>
+                <div className="modal-actions">
+                  <button
+                    className="btn-secondary"
+                    onClick={() => {
+                      setNewEntryOpen(false);
+                      setNewEntryProject('');
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              <AddEntry
+                user_email={email}
+                project_name={newEntryProject}
+                onAdded={() => {
+                  setNewEntryOpen(false);
+                  setNewEntryProject('');
+                  loadData();
+                }}
+                onCancel={() => {
+                  setNewEntryOpen(false);
+                  setNewEntryProject('');
+                }}
+              />
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Voice Feature */}
       {voiceOpen && (

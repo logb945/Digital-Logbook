@@ -7,25 +7,33 @@ import { SettingsPanel } from '@/components/SettingsPanel';
 import { Stats } from '@/components/Stats';
 import { ProjectSettingsPanel } from '@/components/ProjectSettingsPanel';
 import { QuickEntryBar } from '@/components/QuickEntryBar';
+import { ProjectFilterBlock } from '@/components/SearchFilters';
+import {
+  applyProjectFilters,
+  defaultProjectFilters,
+  matchesTextQuery,
+  pinFirst,
+  projectMatchesSearch,
+  type ProjectFilters,
+} from '@/lib/entryFilters';
 import { ActivityFeed } from '@/components/ActivityFeed';
 import { ActivitySummary } from '@/components/ActivitySummary';
 import { addProject } from '@/functions/project/project.js';
-import { addField } from '@/functions/project/fields.js';
+import { addField, getFields } from '@/functions/project/fields.js';
 import { getArchives } from '@/functions/project/archives.js';
 import { setPriority } from '@/functions/project/priority.js';
 import { checkUser } from '@/functions/profile/login.js';
 import { cacheGet, cacheSubscribe, CACHE_STORES } from '@/lib/cache';
 import { syncAllData } from '@/CacheFunctions';
 import { buildProjectColorMap, resolveProjectColor, colorForName } from '@/lib/projectColorMap';
+import { normalizeField } from '@/lib/fieldSchema';
 import { EntryBox } from '@/pages/NewEntry';
-import { ChecklistView } from '@/Templates/EntryTemplates/EntryChecklist';
-import EntriesByDueDateBoard from '@/Templates/ProjectTemplates/EntriesByDueDateBoard';
+import { DueSoonRail } from '@/components/DueSoonRail';
 import { AddEntry } from '@/pages/AddEntry';
 import VoiceFeature from '@/pages/VoiceFeature';
 import { askAI } from '@/functions/ai.js';
 import { getToneInstruction } from '@/functions/tone';
 import { useAiMessagesEnabled } from '@/functions/aiMessages';
-import { usePref, setPref } from '@/functions/preferences';
 import { entryDurationMs, formatTimer } from '@/functions/dashboard/stats.js';
 import { isDueSoon } from '@/functions/dashboard/overdue.js';
 import {
@@ -37,7 +45,7 @@ import { useTimerActions } from '@/hooks/useTimerActions';
 import { useSSEEntries } from '@/hooks/useSSEEntries';
 import { TemplatePicker } from '@/components/fields/TemplatePicker';
 import type { Template } from '@/lib/templateApi';
-import { FiArchive, FiRotateCcw, FiX } from 'react-icons/fi';
+import { FiArchive, FiEdit2, FiRotateCcw, FiX } from 'react-icons/fi';
 import { isOverdue } from '@/functions/dashboard/overdue.js';
 import {
   type CalendarEntry,
@@ -205,27 +213,19 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
     defaultView
   );
 
-  // Display mode for the entries feed (cards/checklist/board) - persisted per-user
-  const rawDisplayMode = usePref('dashboard_display_mode');
-  const displayMode = (
-    rawDisplayMode === 'checklist' || rawDisplayMode === 'board' ? rawDisplayMode : 'cards'
-  ) as 'cards' | 'checklist' | 'board';
-  const setDisplayMode = useCallback((mode: 'cards' | 'checklist' | 'board') => {
-    void setPref('dashboard_display_mode', mode);
-  }, []);
-
-  // Projects live in a slide-over drawer rather than replacing the entries feed.
-  const [projectsDrawerOpen, setProjectsDrawerOpen] = useState(false);
-
-  // Allow closing the projects drawer with the Escape key.
-  useEffect(() => {
-    if (!projectsDrawerOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setProjectsDrawerOpen(false);
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [projectsDrawerOpen]);
+  // Regular (non-AI) search over the current feed
+  const [pageSearch, setPageSearch] = useState('');
+  // Feed filters — the home feed is mixed across projects, so the panel narrows
+  // it by project-level criteria (project name, entry count, field count),
+  // matching the entries page. Field counts are read from the fields cache.
+  const [projectFilters, setProjectFilters] = useState<ProjectFilters>(() =>
+    defaultProjectFilters()
+  );
+  const [fieldCounts, setFieldCounts] = useState<Record<string, number>>({});
+  // Field data types and field names per project — the field-type filter and
+  // the projects-tab search (project name or any of its field names).
+  const [fieldTypes, setFieldTypes] = useState<Record<string, string[]>>({});
+  const [fieldNames, setFieldNames] = useState<Record<string, string[]>>({});
 
   // Data state
   const [projects, setProjects] = useState<Project[]>([]);
@@ -258,6 +258,12 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
   const [archivedEntries, setArchivedEntries] = useState<Entry[]>([]);
   const [archiveError, setArchiveError] = useState<string | null>(null);
   const [localArchived, setLocalArchived] = useState<Set<string>>(new Set());
+  // Pinned projects — localStorage-backed (like the local archived set) so pins
+  // survive reloads; pinned projects sort to the front of the home cards.
+  const [pinnedProjects, setPinnedProjects] = useState<Set<string>>(new Set());
+  // Project card delete flow — inline confirm per card
+  const [confirmDeleteProject, setConfirmDeleteProject] = useState<string | null>(null);
+  const [deletingProject, setDeletingProject] = useState<string | null>(null);
   const [profileAvatar, setProfileAvatar] = useState<string | null>(null);
   const [profileUsername, setProfileUsername] = useState<string | null>(null);
 
@@ -277,26 +283,8 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
     return date < today;
   }, []);
 
-  // FAB menu
-  const [fabOpen, setFabOpen] = useState(false);
-
   // Voice recorder
   const [voiceOpen, setVoiceOpen] = useState(false);
-
-  // The 3 most recently created (unarchived) entries, newest first. Derived
-  // straight from the live entries cache so the list survives reloads and works
-  // offline — unlike the old in-session tracker, which was empty on a fresh load.
-  const recentlyCreatedEntries = useMemo(() => {
-    return entries
-      .filter((e) => !e.archived)
-      .slice()
-      .sort((a, b) => {
-        const at = new Date((a.created_at as string) || 0).getTime();
-        const bt = new Date((b.created_at as string) || 0).getTime();
-        return bt - at;
-      })
-      .slice(0, 3);
-  }, [entries]);
 
   // AI-generated messages
   const [aiGreeting, setAiGreeting] = useState('');
@@ -353,6 +341,8 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
 
   // Project settings panel
   const [projectSettingsOpen, setProjectSettingsOpen] = useState(false);
+  // Project the settings panel edits — set by the Edit button on a project card
+  const [settingsProjectName, setSettingsProjectName] = useState('');
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const projectMenuRef = useRef<HTMLDivElement>(null);
 
@@ -580,14 +570,13 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
   }, [showGreetingToast]);
 
   // Simple, static placeholder for quick entry (no AI)
-  const aiPlaceholder = 'Write what you worked on...';
+  const aiPlaceholder = 'Capture quick entry';
 
   // Close drawer on escape
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setDrawerOpen(false);
-        setFabOpen(false);
         setProjectMenuOpen(false);
       }
     };
@@ -612,7 +601,122 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
     [projects]
   );
 
-  // Filtered entries ΓÇö uses provided sort/search/archive functions
+  // Field counts, field types and field names for the filters and the
+  // projects-tab search. Field definitions live per project, so each project's
+  // rows are read from the cache and only fetched when missing.
+  useEffect(() => {
+    if (!email) return;
+    const names = Array.from(
+      new Set([
+        ...projects.map((p) => p.project_name as string),
+        ...entries.map((e) => e.project_name as string),
+      ])
+    ).filter(Boolean);
+    if (names.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      const nextCounts: Record<string, number> = {};
+      const nextTypes: Record<string, string[]> = {};
+      const nextNames: Record<string, string[]> = {};
+      await Promise.all(
+        names.map(async (name) => {
+          try {
+            let cached = await cacheGet(CACHE_STORES.FIELDS, `${email}:${name}`);
+            if (!cached?.data) cached = await getFields(email, name);
+            const rows = Array.isArray(cached?.data) ? cached.data : [];
+            const fields = rows.filter((r: Record<string, unknown>) => r?.field_name);
+            nextCounts[name] = fields.length;
+            nextTypes[name] = Array.from(
+              new Set(fields.map((r: Record<string, unknown>) => normalizeField(r).data_type))
+            );
+            nextNames[name] = fields.map((r: Record<string, unknown>) => String(r.field_name));
+          } catch {
+            nextCounts[name] = 0;
+            nextTypes[name] = [];
+            nextNames[name] = [];
+          }
+        })
+      );
+      if (!cancelled) {
+        setFieldCounts(nextCounts);
+        setFieldTypes(nextTypes);
+        setFieldNames(nextNames);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [email, projects, entries]);
+
+  // Entry counts per project — powers the "entry count" filter
+  const entryCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const e of entries) {
+      const name = (e.project_name as string) || '';
+      if (name) counts[name] = (counts[name] || 0) + 1;
+    }
+    return counts;
+  }, [entries]);
+
+  // Projects offered in the filter panel — anything with entries or fields
+  const projectNames = useMemo(
+    () =>
+      Array.from(new Set([...Object.keys(entryCounts), ...Object.keys(fieldCounts)])).sort(
+        (a, b) => a.localeCompare(b)
+      ),
+    [entryCounts, fieldCounts]
+  );
+
+  // Load pinned project names for this user (localStorage — no backend column).
+  useEffect(() => {
+    if (!email) return;
+    try {
+      const stored = localStorage.getItem(`dl_pinned_projects_${email}`);
+      setPinnedProjects(new Set(stored ? JSON.parse(stored) : []));
+    } catch {
+      setPinnedProjects(new Set());
+    }
+  }, [email]);
+
+  // Active projects with pinned ones first — drives the home-page card grid.
+  const activeProjects = useMemo(() => {
+    const active = projects.filter((p) => !p.archived);
+    const pinned = active.filter((p) => pinnedProjects.has(p.project_name as string));
+    const rest = active.filter((p) => !pinnedProjects.has(p.project_name as string));
+    return [...pinned, ...rest];
+  }, [projects, pinnedProjects]);
+
+  // Every field type used across the projects — the field-type filter options
+  const fieldTypeOptions = useMemo(
+    () =>
+      Array.from(new Set(Object.values(fieldTypes).flat()))
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b)),
+    [fieldTypes]
+  );
+
+  // Project cards after the regular search and the filters. Search matches the
+  // project name or any of its field names; the filter criteria (entry count,
+  // field count, field type) apply to each project — same as the entries page.
+  const visibleProjects = useMemo(() => {
+    let list = applyProjectFilters(activeProjects, projectFilters, {
+      entryCounts,
+      fieldCounts,
+      fieldTypes,
+    });
+    if (pageSearch.trim()) {
+      list = list.filter((p) =>
+        projectMatchesSearch(
+          (p.project_name as string) || '',
+          fieldNames[(p.project_name as string) || ''] ?? [],
+          pageSearch
+        )
+      );
+    }
+    return list;
+  }, [activeProjects, projectFilters, entryCounts, fieldCounts, fieldTypes, fieldNames, pageSearch]);
+
+  // Filtered entries — uses provided sort/search/archive functions
   const filteredEntries = useMemo(() => {
     // Use all entries (unarchived) — ALL_ENTRIES also holds archived rows, so
     // drop them here; the Archives view sources its list from getArchives.
@@ -638,8 +742,29 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
       )
     );
 
-    return filtered;
-  }, [entries, activeView, archivedProjectNames]);
+    // Regular search — summary, project name and every field value
+    if (pageSearch.trim()) {
+      filtered = filtered.filter((e) => matchesTextQuery(e, pageSearch));
+    }
+
+    // Project filters — project name, entry count, field count, field type
+    filtered = applyProjectFilters(filtered, projectFilters, {
+      entryCounts,
+      fieldCounts,
+      fieldTypes,
+    });
+
+    return pinFirst(filtered);
+  }, [
+    entries,
+    activeView,
+    archivedProjectNames,
+    pageSearch,
+    projectFilters,
+    entryCounts,
+    fieldCounts,
+    fieldTypes,
+  ]);
 
   // In-progress entries (started but not ended). Drives the live dashboard timer.
   const inProgressEntries = useMemo(
@@ -921,6 +1046,46 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
       const { archiveProject } = await import('@/functions/project/archives.js');
       await archiveProject(email, projectName);
     } catch {}
+  };
+
+  // Pin/unpin a project — local-only ordering, persisted per user.
+  const togglePinProject = (projectName: string) => {
+    if (!email) return;
+    setPinnedProjects((prev) => {
+      const next = new Set(prev);
+      if (next.has(projectName)) next.delete(projectName);
+      else next.add(projectName);
+      try {
+        localStorage.setItem(`dl_pinned_projects_${email}`, JSON.stringify([...next]));
+      } catch {}
+      return next;
+    });
+  };
+
+  // Delete a project (project-service cascades its entries server-side).
+  const handleDeleteProject = async (projectName: string) => {
+    if (!email || deletingProject) return;
+    setDeletingProject(projectName);
+    setArchiveError(null);
+    try {
+      const { deleteProject } = await import('@/functions/project/project.js');
+      const result = await deleteProject(email, projectName);
+      if (result?.success === false) {
+        throw new Error(result.message || 'Failed to delete project');
+      }
+    } catch (err) {
+      setArchiveError(err instanceof Error ? err.message : 'Failed to delete project');
+      setDeletingProject(null);
+      setConfirmDeleteProject(null);
+      return;
+    }
+    // Drop it from the in-memory lists immediately; deleteProject already
+    // updated the IndexedDB cache optimistically.
+    setProjects((prev) => prev.filter((p) => p.project_name !== projectName));
+    setArchivedProjects((prev) => prev.filter((p) => p.project_name !== projectName));
+    setDeletingProject(null);
+    setConfirmDeleteProject(null);
+    await loadData();
   };
 
   const handleUnarchiveProject = async (projectName: string) => {
@@ -1564,6 +1729,7 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
                           type="button"
                           className="entry-box__menu-item"
                           onClick={() => {
+                            setSettingsProjectName(activeView);
                             setProjectSettingsOpen(true);
                             setProjectMenuOpen(false);
                           }}
@@ -1592,30 +1758,12 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
                 )}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              {/* Stats dashboard shortcut — shown only on a project view */}
-              {isProjectView && (
-                <button
-                  className="feed-stats-btn"
-                  onClick={() => navigate(`/stats?project=${encodeURIComponent(activeView)}`)}
-                  aria-label="Open stats dashboard"
-                  title="Open the stats dashboard for this project"
-                >
-                  <svg
-                    width="14"
-                    height="14"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                  >
-                    <line x1="18" y1="20" x2="18" y2="10" />
-                    <line x1="12" y1="20" x2="12" y2="4" />
-                    <line x1="6" y1="20" x2="6" y2="14" />
-                  </svg>
-                  Stats Dashboard
-                </button>
-              )}
-              <Stats entries={entries} projects={projects} dueSoonCount={dueSoonCount} />
+              <Stats
+                entries={entries}
+                projects={projects}
+                dueSoonCount={dueSoonCount}
+                activeProject={isProjectView ? activeView : undefined}
+              />
             </div>
           </div>
         </div>
@@ -1713,324 +1861,227 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
           </div>
         ) : (
           <>
-            {/* Display mode + Sort controls */}
-            <div className="feed-controls-row">
-              <div className="feed-view-toggle">
+            {/* Search + AI quick-add bar — project-level filters match the
+                entries page so the funnel icon is available on Home too. */}
+            <div className="search-ai-row">
+              <ProjectFilterBlock
+                query={pageSearch}
+                onQueryChange={setPageSearch}
+                placeholder="Search projects or entries..."
+                projectNames={projectNames}
+                filters={projectFilters}
+                onFiltersChange={setProjectFilters}
+                showProjectName={false}
+                fieldTypeOptions={fieldTypeOptions}
+              />
+              <div data-tour="quick-entry" className="search-ai-row__ai">
+                <QuickEntryBar
+                  onEntryCreated={(info) => {
+                    loadData();
+                    // Only navigate when there's exactly one clear target — a
+                    // multi-match spread across projects must not yank the user
+                    // into an arbitrary one.
+                    if ((info?.created?.length ?? 0) === 1 && info?.projectName) {
+                      navigate(`/project/${encodeURIComponent(info.projectName)}`);
+                    }
+                  }}
+                  onVoiceOpen={() => setVoiceOpen(true)}
+                  placeholder={aiPlaceholder}
+                />
+              </div>
+            </div>
+
+            {/* Page switcher: Projects / Entries — sits above the split so the
+                due-soon rail's top lines up with the project cards. */}
+            <div className="page-switcher-row">
+              <div
+                className="feed-view-toggle"
+                role="group"
+                aria-label="Switch between entries and projects"
+              >
                 <button
-                  className={`feed-view-btn ${projectsDrawerOpen ? 'active' : ''}`}
-                  onClick={() => setProjectsDrawerOpen(true)}
+                  type="button"
+                  className="feed-view-btn active"
+                  aria-current="page"
+                  onClick={() => navigate('/dashboard')}
+                  title="Back to projects"
                 >
                   Projects
+                </button>
+                <button
+                  type="button"
+                  className="feed-view-btn"
+                  onClick={() => navigate('/entries')}
+                  title="Browse all entries"
+                >
+                  Entries
                 </button>
               </div>
             </div>
 
-            {/* Quick Entry Bar - Natural Language */}
-            <div data-tour="quick-entry">
-              <QuickEntryBar
-                onEntryCreated={(info) => {
-                  loadData();
-                  // Only navigate when there's exactly one clear target —
-                  // for multi-match we intentionally stop here and let the
-                  // "Recently created" section drive navigation.
-                  if ((info?.created?.length ?? 0) === 1 && info?.projectName) {
-                    navigate(`/project/${encodeURIComponent(info.projectName)}`);
-                  }
-                }}
-                onVoiceOpen={() => setVoiceOpen(true)}
-                placeholder={aiPlaceholder}
-              />
-            </div>
+            {/* Two-column split: projects + calendar on the left, the due-soon
+                quick list on the right. */}
+            <div className="dash-split">
+              <div className="dash-split__main">
 
-            {/* Due Soon header: label on the left, view toggle on the right */}
-            <div className="due-soon-header-row">
-              <div className="due-soon-section-label">
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+            {/* Projects — inline card grid with quick actions */}
+            <section className="home-projects animate-in" data-tour="home-projects">
+              <div className="projects-grid">
+                {/* Create-new-project card leads the grid so it is always first. */}
+                <button
+                  type="button"
+                  className="project-card project-card--add"
+                  data-tour="home-new-project"
+                  onClick={() => setNewProjectOpen(true)}
+                  title="Create a new project"
                 >
-                  <circle cx="12" cy="12" r="10" />
-                  <polyline points="12 6 12 12 16 14" />
-                </svg>
-                <span>Due soon</span>
-              </div>
-
-              {/* View mode toggle — right-aligned with the Due soon label,
-                  hidden entirely when nothing is due soon. */}
-              {!loading && filteredEntries.length > 0 && (
-                <div className="feed-view-group due-soon-view-toggle">
-                  <span className="feed-view-label">View:</span>
-                  <div className="feed-view-toggle">
-                    <button
-                      className={`feed-view-btn ${displayMode === 'cards' ? 'active' : ''}`}
-                      onClick={() => setDisplayMode('cards')}
+                  <span className="project-card-add-plus" aria-hidden>
+                    +
+                  </span>
+                  <span className="project-card-add-label">Add New Project</span>
+                </button>
+                {visibleProjects.map((project) => {
+                  const name = project.project_name as string;
+                  const count = entries.filter((e) => e.project_name === name).length;
+                  const inMotionCount = entries.filter(
+                    (e) => e.project_name === name && e.status === 'in_motion'
+                  ).length;
+                  const doneCount = entries.filter(
+                    (e) => e.project_name === name && e.status === 'done_and_dusted'
+                  ).length;
+                  const isPinned = pinnedProjects.has(name);
+                  const isConfirmingDelete = confirmDeleteProject === name;
+                  const cardAccent = resolveProjectColor(name, dashColorMap);
+                  return (
+                    <div
+                      key={name}
+                      className={`project-card project-card--actionable ${isPinned ? 'is-pinned' : ''}`}
+                      style={{
+                        borderLeft: `3px solid ${cardAccent}`,
+                        background: `linear-gradient(0deg, ${cardAccent}18, ${cardAccent}18), var(--surface)`,
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => navigate(`/project/${encodeURIComponent(name)}`)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          navigate(`/project/${encodeURIComponent(name)}`);
+                        }
+                      }}
                     >
-                      Cards
-                    </button>
-                    <button
-                      className={`feed-view-btn ${displayMode === 'checklist' ? 'active' : ''}`}
-                      onClick={() => setDisplayMode('checklist')}
-                    >
-                      Checklist
-                    </button>
-                    <button
-                      className={`feed-view-btn ${displayMode === 'board' ? 'active' : ''}`}
-                      onClick={() => setDisplayMode('board')}
-                    >
-                      Board
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Loading */}
-            {loading && (
-              <div className="feed-loading">
-                <div
-                  className="animate-spin spinner-circle"
-                  style={{
-                    width: 24,
-                    height: 24,
-                  }}
-                />
-                <p>Loading items...</p>
-              </div>
-            )}
-
-            {/* Projects slide-over drawer — opens over the dashboard so the
-                entries feed keeps its place instead of being replaced. */}
-            {projectsDrawerOpen && (
-              <div
-                className="projects-drawer-overlay"
-                role="presentation"
-                onClick={() => setProjectsDrawerOpen(false)}
-              >
-                <aside
-                  className="projects-drawer"
-                  role="dialog"
-                  aria-modal="true"
-                  aria-label="Your projects"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <div className="projects-drawer-header">
-                    <h2 className="projects-grid-title">Your Projects</h2>
-                    <button
-                      type="button"
-                      className="projects-drawer-close"
-                      aria-label="Close projects"
-                      onClick={() => setProjectsDrawerOpen(false)}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                  <div className="projects-drawer-body">
-                    {projects.filter((p) => !p.archived).length === 0 ? (
-                      <div className="empty-state animate-in">
-                        <div className="empty-icon">
-                          <svg
-                            width="48"
-                            height="48"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.5"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                          >
-                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                          </svg>
-                        </div>
-                        <h2 className="empty-title">No projects yet</h2>
-                        <p className="empty-desc">Create your first project to get started.</p>
-                        <button
-                          className="btn-primary"
-                          onClick={() => {
-                            setProjectsDrawerOpen(false);
-                            setNewProjectOpen(true);
-                          }}
-                          style={{ marginTop: '1rem' }}
+                      <div className="project-card-header">
+                        <h3 className="project-card-name">{name}</h3>
+                        <span className="project-card-count">{count} entries</span>
+                      </div>
+                      <div className="project-card-stats">
+                        {inMotionCount > 0 && (
+                          <span className="project-card-stat project-card-stat--active">
+                            {inMotionCount} in progress
+                          </span>
+                        )}
+                        {doneCount > 0 && (
+                          <span className="project-card-stat project-card-stat--done">
+                            {doneCount} done
+                          </span>
+                        )}
+                      </div>
+                      {isConfirmingDelete ? (
+                        <div
+                          className="project-card-confirm"
+                          role="group"
+                          aria-label="Confirm project deletion"
+                          onClick={(e) => e.stopPropagation()}
+                          onKeyDown={(e) => e.stopPropagation()}
                         >
-                          + New Project
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="projects-grid">
-                        {projects
-                          .filter((p) => !p.archived)
-                          .map((project) => {
-                            const name = project.project_name as string;
-                            const count = entries.filter((e) => e.project_name === name).length;
-                            const inMotionCount = entries.filter(
-                              (e) => e.project_name === name && e.status === 'in_motion'
-                            ).length;
-                            const doneCount = entries.filter(
-                              (e) => e.project_name === name && e.status === 'done_and_dusted'
-                            ).length;
-                            return (
-                              <button
-                                key={name}
-                                className="project-card"
-                                onClick={() => {
-                                  setProjectsDrawerOpen(false);
-                                  navigate(`/project/${encodeURIComponent(name)}`);
-                                }}
-                              >
-                                <div className="project-card-header">
-                                  <h3 className="project-card-name">{name}</h3>
-                                  <span className="project-card-count">{count} entries</span>
-                                </div>
-                                <div className="project-card-stats">
-                                  {inMotionCount > 0 && (
-                                    <span className="project-card-stat project-card-stat--active">
-                                      {inMotionCount} in progress
-                                    </span>
-                                  )}
-                                  {doneCount > 0 && (
-                                    <span className="project-card-stat project-card-stat--done">
-                                      {doneCount} done
-                                    </span>
-                                  )}
-                                </div>
-                              </button>
-                            );
-                          })}
-                      </div>
-                    )}
-                  </div>
-                </aside>
+                          <span className="project-card-confirm-text">Delete this project?</span>
+                          <button
+                            type="button"
+                            className="project-card-confirm-yes"
+                            disabled={deletingProject === name}
+                            onClick={() => handleDeleteProject(name)}
+                          >
+                            {deletingProject === name ? 'Deleting…' : 'Yes, delete'}
+                          </button>
+                          <button
+                            type="button"
+                            className="project-card-confirm-cancel"
+                            onClick={() => setConfirmDeleteProject(null)}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <div
+                          className="project-card-actions"
+                          onClick={(e) => e.stopPropagation()}
+                          onKeyDown={(e) => e.stopPropagation()}
+                        >
+                          <button
+                            type="button"
+                            className="project-card-action-btn"
+                            onClick={() => {
+                              setSettingsProjectName(name);
+                              setProjectSettingsOpen(true);
+                            }}
+                            title="Edit project"
+                          >
+                            <FiEdit2 size={12} />
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            className={`project-card-action-btn project-card-pin-btn ${isPinned ? 'is-pinned' : ''}`}
+                            aria-pressed={isPinned}
+                            onClick={() => togglePinProject(name)}
+                            title={isPinned ? 'Unpin project' : 'Pin project'}
+                          >
+                            <svg
+                              width="13"
+                              height="13"
+                              viewBox="0 0 24 24"
+                              fill={isPinned ? 'currentColor' : 'none'}
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            >
+                              <line x1="12" y1="17" x2="12" y2="22" />
+                              <path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24z" />
+                            </svg>
+                            {isPinned ? 'Pinned' : 'Pin'}
+                          </button>
+                          <button
+                            type="button"
+                            className="project-card-action-btn"
+                            onClick={() => handleArchiveProject(name)}
+                            title="Archive project"
+                          >
+                            <FiArchive size={12} />
+                            Archive
+                          </button>
+                          <button
+                            type="button"
+                            className="project-card-action-btn project-card-action-btn--danger"
+                            onClick={() => setConfirmDeleteProject(name)}
+                            title="Delete project"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
-            )}
+              {visibleProjects.length === 0 && (
+                <p className="projects-empty-note">No projects match your search or filters.</p>
+              )}
+            </section>
 
-            {/* Entries feed. Each display mode gets its own wrapper: cards
-                use the multi-column .entries-feed grid, but board and
-                checklist need full-width containers or the card grid squeezes
-                them into one narrow track and they stack vertically. */}
-            {!loading && filteredEntries.length === 0 && (
-              <div className="entries-feed">
-                <div className="empty-state animate-in">
-                  <div className="empty-icon">
-                    <svg
-                      width="48"
-                      height="48"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.5"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <>
-                        <circle cx="12" cy="12" r="10" />
-                        <polyline points="12 6 12 12 16 14" />
-                      </>
-                    </svg>
-                  </div>
-                  <h2 className="empty-title">Nothing due soon</h2>
-                  <p className="empty-desc">No items are due within the next 3 days.</p>
-                </div>
-              </div>
-            )}
+            {/* Due-soon feed removed — the same entries now live in the right rail. */}
 
-            {displayMode === 'checklist' && !loading && filteredEntries.length > 0 && (
-              <div className="dashboard-checklist-grid">
-                <ChecklistView
-                  entries={filteredEntries.map((r) => ({
-                    id: r.id as string,
-                    user_email: r.user_email as string,
-                    project_name: r.project_name as string,
-                    summary: (r.summary as string) || null,
-                    due_date: (r.due_date as string) || null,
-                    status: (r.status as 'up_next' | 'in_motion' | 'done_and_dusted') || 'up_next',
-                    entries: r.entries as Record<string, unknown> | string | null,
-                    started_at: (r.started_at as string) || null,
-                  }))}
-                  onUpdated={() => loadData()}
-                  onDelete={() => loadData()}
-                  colorMap={dashColorMap}
-                />
-              </div>
-            )}
-
-            {displayMode === 'board' && !loading && filteredEntries.length > 0 && (
-              <div className="dashboard-board-grid">
-                <EntriesByDueDateBoard
-                  entries={filteredEntries.map((r) => ({
-                    id: r.id as string,
-                    user_email: r.user_email as string,
-                    project_name: r.project_name as string,
-                    summary: (r.summary as string) || null,
-                    due_date: (r.due_date as string) || null,
-                    status: (r.status as 'up_next' | 'in_motion' | 'done_and_dusted') || 'up_next',
-                    entries: r.entries as Record<string, unknown> | string | null,
-                    started_at: (r.started_at as string) || null,
-                  }))}
-                  onUpdated={() => loadData()}
-                  onDelete={() => loadData()}
-                  colorMap={dashColorMap}
-                />
-              </div>
-            )}
-
-            {displayMode === 'cards' && !loading && filteredEntries.length > 0 && (
-              <div className="entries-feed">
-                {filteredEntries.map((row, i) => (
-                  <EntryBox
-                    key={`entry-${row.id || i}`}
-                    entry={row as any}
-                    onUpdated={() => loadData()}
-                    onPriorityChanged={handleSetPriority}
-                    onDelete={() => loadData()}
-                    projectColor={resolveProjectColor(
-                      (row.project_name as string) || '',
-                      dashColorMap
-                    )}
-                  />
-                ))}
-              </div>
-            )}
-
-            {/* Recently created — the 3 newest entries, listed under Due soon. */}
-            {!loading && recentlyCreatedEntries.length > 0 && (
-              <div className="recent-section">
-                <div className="due-soon-section-label">
-                  <svg
-                    width="16"
-                    height="16"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <path d="M12 5v14M5 12h14" />
-                  </svg>
-                  <span>Recently created</span>
-                </div>
-                <div className="recent-list">
-                  {recentlyCreatedEntries.map((e, i) => (
-                    <button
-                      key={`recent-created-${e.id || i}`}
-                      className="recent-item"
-                      onClick={() =>
-                        navigate(`/project/${encodeURIComponent(String(e.project_name))}`)
-                      }
-                      title={getEntryTitle(e as any)}
-                    >
-                      <span className="recent-item-title">{getEntryTitle(e as any)}</span>
-                      <span className="recent-item-project">{e.project_name as string}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
+            {/* Entries feed removed — the due-soon entries live in the right rail. */}
 
             {/* Calendar Section */}
             <div className="dashboard-calendar-section">
@@ -2161,99 +2212,13 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
                 </span>
               </div>
             </div>
+              </div>
+
+              <DueSoonRail entries={filteredEntries} />
+            </div>
           </>
         )}
       </main>
-
-      {/* FAB */}
-      <div className="fab-container">
-        {fabOpen && (
-          <div className="fab-menu">
-            {projects.filter((p) => !p.archived).length > 0 ? (
-              <button
-                className="fab-menu-item"
-                onClick={() => {
-                  setNewEntryOpen(true);
-                  setFabOpen(false);
-                }}
-                title="Create a new item in one of your projects"
-              >
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                >
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                  <polyline points="14 2 14 8 20 8" />
-                  <line x1="12" y1="11" x2="12" y2="17" />
-                  <line x1="9" y1="14" x2="15" y2="14" />
-                </svg>
-                New Item
-              </button>
-            ) : (
-              <div className="fab-menu-hint" title="You need to create a project first">
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                >
-                  <circle cx="12" cy="12" r="10" />
-                  <line x1="12" y1="8" x2="12" y2="12" />
-                  <line x1="12" y1="16" x2="12.01" y2="16" />
-                </svg>
-                <span>Create a project first</span>
-              </div>
-            )}
-            <button
-              className="fab-menu-item"
-              onClick={() => {
-                setNewProjectOpen(true);
-                setFabOpen(false);
-              }}
-              title="Create a new project to organize your items"
-            >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-              >
-                <path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-              </svg>
-              New Project
-            </button>
-          </div>
-        )}
-        <button
-          className={`fab ${fabOpen ? 'fab-open' : ''}`}
-          onClick={() => setFabOpen(!fabOpen)}
-          aria-label="Quick actions"
-          title="Quick actions: create a new item or project"
-        >
-          <svg
-            width="20"
-            height="20"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <line x1="12" y1="5" x2="12" y2="19" />
-            <line x1="5" y1="12" x2="19" y2="12" />
-          </svg>
-          <span className="fab-label">New</span>
-        </button>
-      </div>
 
       {/* New Project Modal */}
       {newProjectOpen && (
@@ -2603,9 +2568,9 @@ export function Dashboard({ defaultView = 'all' }: DashboardProps) {
       {/* Project Settings Panel */}
       <ProjectSettingsPanel
         open={projectSettingsOpen}
-        projectName={activeView}
+        projectName={settingsProjectName}
         userEmail={email}
-        currentColor={dashColorMap[activeView] || null}
+        currentColor={dashColorMap[settingsProjectName] || null}
         onClose={() => setProjectSettingsOpen(false)}
         onProjectUpdated={() => {
           setActiveView('all');
